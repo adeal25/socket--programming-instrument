@@ -10,10 +10,10 @@ namespace Client
 {
     class Program
     {
-        private static Socket sender;
+        private static Socket? sender;
         private static bool isConnected = false;
         private static bool isRunning = true;
-        private static bool SedangMengirim = false;
+        private static bool isSending = false;
         private static EventWaitHandle sendHandle = new AutoResetEvent(true);
         private static bool receiveACK = false;
         private static bool receiveNAK = false;
@@ -152,21 +152,9 @@ namespace Client
                     
                     for (int i = 0; i<bytesReceived; i++)
                     {
-                        if (SedangMengirim == true)
+                        if (isSending == true)
                         {                        
-                            if (receiveBuffer[i] == 0x06)
-                            {
-                                LogWithTime("INFO","Server terima: <ACK>");
-                                receiveACK = true;
-                                sendHandle.Set();
-                            }
-                            else if ( receiveBuffer[i] == 0x15)
-                            {
-                                LogWithTime("INFO","Server terima: <NAK>");
-                                receiveNAK = true;
-                                sendHandle.Set();
-                                
-                            }
+                            HandleAckNak(receiveBuffer);
                         }
                         else
                         {
@@ -216,11 +204,11 @@ namespace Client
 
                                         byte cs1Byte = finalMsgBuff[endIdk - 2];
                                         byte cs2Byte = finalMsgBuff[endIdk - 1];
-                                        string receivedCs1 =  cs1Byte.ToString("X2")[1].ToString();
-                                        string receivedCs2 =  cs2Byte.ToString("X2")[1].ToString();
+                                        string cs1Val =  cs1Byte.ToString("X2")[1].ToString();
+                                        string cs2Val =  cs2Byte.ToString("X2")[1].ToString();
 
                                         // Validate Payload data by calculating checksum while receiving data transmited
-                                        if (ValidateChecksum(chunkBytes, receivedCs1, receivedCs2))
+                                        if (ValidateChecksum(chunkBytes, cs1Val, cs2Val))
                                         {
                                             LogWithTime("DEBUG","Checksum Cocok, Server kirim: <ACK>");
                                             sender.Send(new byte[] {0x06});
@@ -253,14 +241,7 @@ namespace Client
             
                                     if (finalMsgBuff.IndexOf(0x04) != -1)
                                     {   
-                                        LogWithTime("INFO", "Akhir transmisi pesan: <EOT>");
-                                        LogWithTime("INFO", "Server terima semua pesan:");
-
-                                        string fullMessage = Encoding.ASCII.GetString(finalMessage.ToArray());
-                                        // ParseData(fullMessage);
-
-                                        finalMsgBuff.Clear();
-                                        finalMessage.Clear();
+                                        HandleEOT(finalMsgBuff, finalMessage);
                                         break;
                                     }
                                 }
@@ -290,6 +271,35 @@ namespace Client
             }
         }
 
+        private static void HandleAckNak(byte[] receiveBuffer)
+        {
+            if (receiveBuffer[0] == 0x06)
+            {
+                LogWithTime("INFO","Server terima: <ACK>");
+                receiveACK = true;
+                sendHandle.Set();
+            }
+            else if ( receiveBuffer[0] == 0x15)
+            {
+                LogWithTime("INFO","Server terima: <NAK>");
+                receiveNAK = true;
+                sendHandle.Set();
+            }
+        }
+
+        private static void HandleEOT(List<byte> finalMsgBuff, List<byte> finalMessage)
+        {
+            LogWithTime("INFO", "Akhir transmisi pesan: <EOT>");
+            LogWithTime("INFO", "Server terima semua pesan:");
+
+            string fullMessage = Encoding.ASCII.GetString(finalMessage.ToArray());
+            // ParseData(fullMessage);
+
+            finalMsgBuff.Clear();
+            finalMessage.Clear();
+            
+        }
+
         private static void ClientSendMessage()
         {
             if (sender == null) return;
@@ -297,41 +307,48 @@ namespace Client
             while (isRunning)
             {
 
-                string messageToAlat =  "PAT|3005|ABDUL|HAMID|19761005|MAWAR|20240807101010\n" +
+                string staticMessage =  "PAT|3005|ABDUL|HAMID|19761005|MAWAR|20240807101010\n" +
                                     "SMP|0809240015|DARAH\n" +
                                     "ORD|GULA|10.7|mm/dl\n" +
                                     "ORD|LEMAK|887.9|mm/dl\n" +
                                     "ORD|ASAM_URAT|65.3|mm/dl";
-
+                
                 KirimDariAwal:
 
-                SedangMengirim = true;
+                isSending = true;
                 bool sendSuccess = false;
                 byte[] soh = new byte[] { 0x01 };
                 sender.Send(soh);
                 LogWithTime("DEBUG","Klien kirim: <SOH>");
-
+                
                 // Wait for ACK
                 sendHandle.WaitOne();
-
-
-
-                // byte[] messageBuffer = Encoding.ASCII.GetBytes(userMessage);
+                
                 int bufferSize = 255;
-
-                string[] messageLines = messageToAlat.Split("\n");
-
+                string[] messageLines = staticMessage.Split("\n");
+                
                 foreach (string line in messageLines)
                 {
                     byte[] messageBuffer = Encoding.ASCII.GetBytes(line);
+                    sendSuccess = SendMessageChunks(messageBuffer, bufferSize);
+                    if (!sendSuccess)
+                    {
+                        goto KirimDariAwal;
+                    }             
+                }
                 
-                
-
-                for (int i = 0; i < messageBuffer.Length; i += bufferSize)
+                if (sendSuccess)
                 {
-                    int retryCountCs = 0;
-                    sendSuccess = false;
+                    SendEOT();
+                    break;
+                }
+            }
+        }
 
+        private static bool SendMessageChunks(byte[] messageBuffer, int bufferSize)
+        {
+            for (int i = 0; i < messageBuffer.Length; i += bufferSize)
+                {
                     bool isLastChunk = i + bufferSize >= messageBuffer.Length;
                     int chunkSize = isLastChunk ? messageBuffer.Length - i : bufferSize;
                     byte[] chunkBuffer = new byte[chunkSize];
@@ -339,62 +356,71 @@ namespace Client
 
                     string chunkMessage = Encoding.ASCII.GetString(chunkBuffer);
 
-                    while (retryCountCs < 5 && !sendSuccess)
+                    if(!SendChunk(chunkBuffer, chunkMessage, isLastChunk))
                     {
-                        KirimUlangPotongan:
-
-                        string checksumValues = CalculateChecksum(chunkBuffer);
-                        byte cs1 = Convert.ToByte(checksumValues[0].ToString(), 16);
-                        byte cs2 = Convert.ToByte(checksumValues[1].ToString(), 16);
-                        
-                        byte[] messageToSend = Encoding.ASCII.GetBytes($"\x02{chunkMessage}\x0D");
-                        
-                        messageToSend = AppendBytes(messageToSend, new byte[] { cs1, cs2 });
-                        messageToSend = AppendBytes(messageToSend, new byte[] { isLastChunk? (byte)0x03 : (byte)0x23 });
-
-                        LogWithTime("DEBUG", $"Klien kirim pesan: <STX>{chunkMessage}<CR>{cs1}{cs2}{(isLastChunk ? "<ETX>" : "<ETB>")}");
-                        sender.Send(messageToSend);
-
-                        sendHandle.Reset();
-                        sendHandle.WaitOne(1000);
-                        if (receiveNAK == true && retryCountCs < 5)
-                        {
-                            LogWithTime("DEBUG", $"Klien kirim ulang: Percobaan ke {retryCountCs+1}: {chunkMessage}");
-                            retryCountCs++;
-                            receiveNAK = false;
-                            goto KirimUlangPotongan;
-                        }
-                        else if (receiveACK == true)
-                        {
-                            receiveACK = false;
-                            sendSuccess = true;
-                        }
-                        else if (retryCountCs >= 5)
-                        {
-                            LogWithTime("ERROR", $"Gagal mengirim pesan setelah {retryCountCs} percobaan. Mengirim <EOT> dan berhenti.");
-                            sender.Send(new byte[] { 0x04 }); // Send EOT
-                            LogWithTime("DEBUG", "Klien kirim: <EOT>");
-                            SedangMengirim = false;
-                            break;
-                        }
-                        
-                        else
-                        {
-                            LogWithTime("DEBUG", "Tidak ada respons dari server. Mengulang dari awal...");
-                            goto KirimDariAwal;
-                        }
+                        return false;
                     }
                 }
-                }
-                if (sendSuccess == true)
+            return true;
+        }
+
+        private static bool SendChunk(byte[] chunkBuffer, string chunkMessage, bool isLastChunk)
+        {
+            int retryCountCs = 0;
+            bool sendSuccess = false;
+
+            while (retryCountCs < 5 && !sendSuccess)
+            {
+                KirimUlangPotongan:
+                byte[] messageToSend = Encoding.ASCII.GetBytes($"\x02{chunkMessage}\x0D");
+
+                string checksumValues = CalculateChecksum(chunkBuffer);
+                byte cs1 = Convert.ToByte(checksumValues[0].ToString(), 16);
+                byte cs2 = Convert.ToByte(checksumValues[1].ToString(), 16);
+                
+                messageToSend = AppendBytes(messageToSend, new byte[] { cs1, cs2 });
+                messageToSend = AppendBytes(messageToSend, new byte[] { isLastChunk? (byte)0x03 : (byte)0x23 });
+
+                LogWithTime("DEBUG", $"Klien kirim pesan: <STX>{chunkMessage}<CR>{cs1}{cs2}{(isLastChunk ? "<ETX>" : "<ETB>")}");
+                sender.Send(messageToSend);
+
+                sendHandle.Reset();
+                sendHandle.WaitOne(1000);
+                if (receiveNAK == true && retryCountCs < 5)
                 {
-                    sender.Send(new byte[] { 0x04 }); // Send EOT
-                    LogWithTime("DEBUG", "Klien kirim: <EOT>");
-                    SedangMengirim = false;
-                    break;
+                    LogWithTime("DEBUG", $"Klien kirim ulang: Percobaan ke {retryCountCs+1}: {chunkMessage}");
+                    retryCountCs++;
+                    receiveNAK = false;
+                    goto KirimUlangPotongan;
+                }
+                else if (receiveACK == true)
+                {
+                    receiveACK = false;
+                    sendSuccess = true;
+                }
+                else if (retryCountCs >= 5)
+                {
+                    LogWithTime("ERROR", $"Gagal mengirim pesan setelah {retryCountCs} percobaan. Mengirim <EOT> dan berhenti.");
+                    SendEOT();
+                    isSending = false;
+                    return false;
+                }
+                
+                else
+                {
+                    LogWithTime("DEBUG", "Tidak ada respons dari server. Mengulang dari awal...");
+                    return false;
                 }
             }
+            return true;
         }
+
+        private static void SendEOT()
+        {
+            sender.Send(new byte[] { 0x04 }); // Send EOT
+            LogWithTime("DEBUG", "Klien kirim: <EOT>");
+        }
+
 
         private static void LogWithTime(string logLevel, string message)
         {
@@ -410,31 +436,27 @@ namespace Client
             return result;
         }
 
-
         private static string CalculateChecksum(byte[] message)
         {
             int checksum = 0;
-
             foreach (byte b in message)
             {
                 checksum += b;
             }
-
             checksum = checksum % 256;
-
             return checksum.ToString("X2");
         }
 
-        private static bool ValidateChecksum(byte[] chunkBytes, string receivedCs1, string receivedCs2)
+        private static bool ValidateChecksum(byte[] chunkBytes, string cs1Val, string cs2Val)
         {
             // Now that the Checksum method returns a single string instead of an array, you need to modify this method accordingly.
             string calculatedChecksum = CalculateChecksum(chunkBytes);
             
             // Log the received and calculated checksums for debugging.
-            LogWithTime("INFO", $"Checksum received: {receivedCs1}{receivedCs2}, Calculated: {calculatedChecksum}");
+            LogWithTime("INFO", $"Checksum received: {cs1Val}{cs2Val}, Calculated: {calculatedChecksum}");
 
             // Compare the entire checksum strings instead of splitting them.
-            return calculatedChecksum == $"{receivedCs1}{receivedCs2}";
+            return calculatedChecksum == $"{cs1Val}{cs2Val}";
         }
 
     }
