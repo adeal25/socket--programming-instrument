@@ -330,14 +330,61 @@ namespace Client
                 foreach (string line in messageLines)
                 {
                     byte[] messageBuffer = Encoding.ASCII.GetBytes(line);
-                    sendSuccess = SendMessageChunks(messageBuffer, bufferSize);
-                    if (!sendSuccess)
+                    for (int i = 0; i < messageBuffer.Length; i += bufferSize)
                     {
-                        goto KirimDariAwal;
-                    }             
+                        int retryCountCs = 0;
+                        sendSuccess = false;
+                        bool isLastChunk = i + bufferSize >= messageBuffer.Length;
+                        int chunkSize = isLastChunk ? messageBuffer.Length - i : bufferSize;
+                        byte[] chunkBuffer = new byte[chunkSize];
+                        Array.Copy(messageBuffer, i, chunkBuffer, 0, chunkSize);
+                        string chunkMessage = Encoding.ASCII.GetString(chunkBuffer);
+                        while (retryCountCs < 5 && !sendSuccess)
+                        {
+                            KirimUlangPotongan:
+                            string checksumValues = CalculateChecksum(chunkBuffer);
+                            byte cs1 = Convert.ToByte(checksumValues[0].ToString(), 16);
+                            byte cs2 = Convert.ToByte(checksumValues[1].ToString(), 16);
+                            
+                            byte[] messageToSend = Encoding.ASCII.GetBytes($"\x02{chunkMessage}\x0D");
+                            
+                            messageToSend = AppendBytes(messageToSend, new byte[] { cs1, cs2 });
+                            messageToSend = AppendBytes(messageToSend, new byte[] { isLastChunk? (byte)0x03 : (byte)0x23 });
+                            LogWithTime("DEBUG", $"Klien kirim pesan: <STX>{chunkMessage}<CR>{cs1}{cs2}{(isLastChunk ? "<ETX>" : "<ETB>")}");
+                            sender.Send(messageToSend);
+                            sendHandle.Reset();
+                            sendHandle.WaitOne(1000);
+                            if (receiveNAK == true && retryCountCs < 5)
+                            {
+                                LogWithTime("DEBUG", $"Klien kirim ulang: Percobaan ke {retryCountCs+1}: {chunkMessage}");
+                                retryCountCs++;
+                                receiveNAK = false;
+                                // goto KirimUlangPotongan;
+                            }
+                            else if (receiveACK == true)
+                            {
+                                receiveACK = false;
+                                sendSuccess = true;
+                            }
+                            else if (retryCountCs >= 5)
+                            {
+                                LogWithTime("ERROR", $"Gagal mengirim pesan setelah {retryCountCs} percobaan. Mengirim <EOT> dan berhenti.");
+                                sender.Send(new byte[] { 0x04 }); // Send EOT
+                                LogWithTime("DEBUG", "Klien kirim: <EOT>");
+                                isSending = false;
+                                break;
+                            }
+                            
+                            else
+                            {
+                                LogWithTime("DEBUG", "Tidak ada respons dari server. Mengulang dari awal...");
+                                // goto KirimDariAwal;
+                            }
+                        }   
+                    }          
                 }
                 
-                if (sendSuccess)
+                if (sendSuccess==true)
                 {
                     SendEOT();
                     break;
@@ -373,6 +420,8 @@ namespace Client
             {
                 KirimUlangPotongan:
                 byte[] messageToSend = Encoding.ASCII.GetBytes($"\x02{chunkMessage}\x0D");
+                // byte[] messageToSend = messageToSend.Add(0x02)
+
 
                 string checksumValues = CalculateChecksum(chunkBuffer);
                 byte cs1 = Convert.ToByte(checksumValues[0].ToString(), 16);
@@ -391,7 +440,7 @@ namespace Client
                     LogWithTime("DEBUG", $"Klien kirim ulang: Percobaan ke {retryCountCs+1}: {chunkMessage}");
                     retryCountCs++;
                     receiveNAK = false;
-                    goto KirimUlangPotongan;
+                    // goto KirimUlangPotongan;
                 }
                 else if (receiveACK == true)
                 {
@@ -412,13 +461,14 @@ namespace Client
                     return false;
                 }
             }
-            return true;
+            return sendSuccess;
         }
 
         private static void SendEOT()
         {
             sender.Send(new byte[] { 0x04 }); // Send EOT
             LogWithTime("DEBUG", "Klien kirim: <EOT>");
+            isSending = false;
         }
 
 
